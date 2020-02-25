@@ -39,43 +39,11 @@ char a_path[PATH_MAX];
 
 filesystem f;
 
-z_stream strm;
+
 
 /* CHUNK is the size of the memory chunk used by the zlib routines. */
 
 #define CHUNK 0x4000
-
-/* The following macro calls a zlib routine and checks the return
-   value. If the return value ("status") is not OK, it prints an error
-   message and exits the program. Zlib's error statuses are all less
-   than zero. */
-
-#define CALL_ZLIB(x) {                                                  \
-        int status;                                                     \
-        status = x;                                                     \
-        if (status < 0) {                                               \
-            fprintf (stderr,                                            \
-                     "%s:%d: %s returned a bad status of %d.\n",        \
-                     __FILE__, __LINE__, #x, status);                   \
-            exit (EXIT_FAILURE);                                        \
-        }                                                               \
-    }
-
-/* These are parameters to deflateInit2. See
-   http://zlib.net/manual.html for the exact meanings. */
-
-#define windowBits 15
-#define GZIP_ENCODING 16
-
-static void strm_init (z_stream * strm)
-{
-    strm->zalloc = Z_NULL;
-    strm->zfree  = Z_NULL;
-    strm->opaque = Z_NULL;
-    CALL_ZLIB (deflateInit2 (strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
-                             windowBits | GZIP_ENCODING, 8,
-                             Z_DEFAULT_STRATEGY));
-}
 
 void nodes_init()
 {
@@ -175,8 +143,7 @@ int get_free_block_index()
 
 int hello_init() 
 {
-	strm_init (& strm);
-
+	
 	f.block_size = BLOCK_SIZE;
 	f.nnodes = NNODES;
 	f.nblocks = NBLOCKS;
@@ -195,8 +162,7 @@ int hello_init()
 			fread(f.nodes, sizeof(node), f.nnodes, fp);
 			fread(f.blocks, sizeof(block), f.nblocks, fp);
 			//print_info();
-		}
-		else {
+		} else {
 			fp = fopen(filename, "w+");
 			nodes_init();
 			blocks_init();
@@ -346,6 +312,42 @@ int hello_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 	return 0;
 }
 
+// compress using zlib
+int hello_compress(const char *in, const char *out) {
+
+	z_stream strm;
+	strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+
+	strm.next_in = (Bytef *)in;
+	strm.next_out = (Bytef *)out;
+
+	deflateInit(&strm, Z_BEST_COMPRESSION);
+	deflate(&strm, Z_FINISH);
+	deflateEnd(&strm);
+
+	return 0;
+}
+
+// uncompress using zlib
+int hello_uncompress(const char *in, const char *out) {
+
+	z_stream strm;
+	strm.zalloc = Z_NULL; 
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+
+	strm.next_in = (Bytef *)in;
+	strm.next_out = (Bytef *)out;
+
+	inflateInit(&strm);
+    inflate(&strm, Z_SYNC_FLUSH);
+    inflateEnd(&strm);
+
+	return 0;
+}
+
 int hello_read(const char *path, char *buf, size_t size, off_t offset,
 		      struct fuse_file_info *fi)
 {
@@ -367,24 +369,36 @@ int hello_read(const char *path, char *buf, size_t size, off_t offset,
 	if ( fileblock == -1 )
 		return 0;
 	
+	
+	char *cbuf = malloc(sizeof(char *));
+	char *ubuf = malloc(sizeof(char *));
+
+	char *cmpFlg = "CMP_FLAG";
+	char *nchng = "N_CHANGES";
+	char *cmpFlgVal = NULL;
+	char *nchngVal = NULL;
+	
+	hello_getxattr(path, cmpFlg, cmpFlgVal, 1);
+	hello_getxattr(path, nchng, nchngVal, 1);
+
 	//seek to the offset with fileblock pointer
 	while ( offset-size2 > 0 ) {
 		fileblock = f.blocks[fileblock].next_block;
 		offset -= size2;
 	}
 
-	char* value;
-	hello_getxattr(path, "CMP_FLAG", value, 0);
-	
-	if (strcmp(value, "1")) {
-
+	// start actual read
+	if(cmpFlgVal && strcmp(cmpFlgVal, "1")) {
+		cbuf = f.blocks[fileblock].data;
+		hello_uncompress(cbuf, ubuf);
+		cbuf = malloc(sizeof(char *));
+	} else {
+		ubuf = f.blocks[fileblock].data;	
 	}
 
-	// start actual read
-	
 	// read partial block
 	if ( offset > 0 ) {
-		memcpy(buf, f.blocks[fileblock].data + offset , size2-offset);
+		memcpy(buf, ubuf , size2-offset);
 		fileblock = f.blocks[fileblock].next_block;
 	}
 	
@@ -399,7 +413,15 @@ int hello_read(const char *path, char *buf, size_t size, off_t offset,
 			break;
 		}
 		
-		memcpy(buf + offset, f.blocks[fileblock].data , size2);
+		if(cmpFlgVal && strcmp(cmpFlgVal, "1")) {
+			cbuf = f.blocks[fileblock].data;
+			hello_uncompress(cbuf, ubuf);
+			cbuf = malloc(sizeof(char *));
+		} else {
+			ubuf = f.blocks[fileblock].data;	
+		}
+
+		memcpy(buf + offset, ubuf , strlen(ubuf));
 		fileblock = f.blocks[fileblock].next_block;
 		offset += size2;
 	}			
@@ -430,6 +452,31 @@ int hello_write(const char *path, const char *buf, size_t size, off_t offset,
 		f.nodes[i].start_block = fileblock;
 	}
 
+	char *cbuf = malloc(sizeof(char *));
+	char *ubuf = malloc(sizeof(char *));
+
+	char *cmpFlg = "CMP_FLAG";
+	char *nchng = "N_CHANGES";
+	char *cmpFlgVal = NULL;
+	char *nchngVal = NULL;
+	int compressed = 0;
+	
+	hello_getxattr(path, cmpFlg, cmpFlgVal, 1);
+	hello_getxattr(path, nchng, nchngVal, 1);
+
+	int nchngInt = 0;
+
+	if(nchngVal) 
+		nchngInt = atoi(nchngVal);
+	
+	if(cmpFlgVal && strcmp(cmpFlgVal, "1")) {
+		cbuf = f.blocks[fileblock].data;
+		hello_uncompress(cbuf, ubuf);
+		cbuf = malloc(sizeof(char *));
+	} else {
+		ubuf = f.blocks[fileblock].data;	
+	}
+	
 	//seek to the offset with fileblock pointer
 	while ( offset-size2 > 0 ) {
 		fileblock = f.blocks[fileblock].next_block;
@@ -440,10 +487,18 @@ int hello_write(const char *path, const char *buf, size_t size, off_t offset,
 	
 	// write partial block
 	if ( offset > 0 ) {
-		memcpy(f.blocks[fileblock].data + offset, buf, size2-offset);
+		memcpy(ubuf + offset, buf, size2-offset);
 		last = fileblock;
 		fileblock = f.blocks[fileblock].next_block;
 		offset = size2 - offset;
+		if(size > CH_THRES) {
+			hello_compress(ubuf, cbuf);
+			memcpy(f.blocks[fileblock].data, cbuf, strlen(cbuf + offset));
+			compressed = 1;
+		} else {
+			memcpy(f.blocks[fileblock].data, ubuf, strlen(ubuf+offset));
+		
+		}
 	}
 
 	// write to all other whole blocks
@@ -461,13 +516,27 @@ int hello_write(const char *path, const char *buf, size_t size, off_t offset,
 			}
 			f.blocks[last].next_block = fileblock;
 		}
+		memcpy(ubuf, buf + offset , size2);
 
-		memcpy(f.blocks[fileblock].data, buf + offset , size2);
+		if(size > CH_THRES) {
+			hello_compress(ubuf, cbuf);
+			memcpy(f.blocks[fileblock].data, cbuf, strlen(cbuf + offset));
+			compressed = 1;
+		} else {
+			memcpy(f.blocks[fileblock].data, ubuf, strlen(ubuf+offset));
+		
+		}
+			
 		last = fileblock;
 		fileblock = f.blocks[fileblock].next_block;
 		offset += size2;
 	}
-	
+
+	if(compressed == 1) {
+		hello_setxattr(path, cmpFlg, "1", 1, 0);
+		hello_setxattr(path, nchng, (char *)size, 1, 0);
+	}
+		
 	f.nodes[i].size += offset;
 	
 	return offset;	 
@@ -708,10 +777,7 @@ struct fuse_operations hello_oper = {
 	.getxattr   = hello_getxattr,
 	.setxattr   = hello_setxattr,
 	.listxattr  = hello_listxattr,
-	.removexattr= hello_removexattr,
-	.fsync 		= hello_fsync,
-	.fsyncdir   = hello_fsyncdir
-	
+	.removexattr= hello_removexattr	
 };
 
 int main(int argc, char *argv[])

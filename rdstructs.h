@@ -1,6 +1,6 @@
 #define PATH_MAX 256
 #define BLOCK_SIZE 512
-#define CH_THRES 200
+#define CH_THRES 10
 
 typedef enum {usedblock, unusedblock} block_status;
 typedef enum {used, unused} node_status;
